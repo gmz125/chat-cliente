@@ -237,32 +237,100 @@ const App = () => {
     }
     return () => { if (intervalo) clearInterval(intervalo); };
   }, [conectado, socket]);
-
-  const conectar = () => {
-  if (nombre.trim()) {
-    const ws = new WebSocket('wss://chat-servidor-production.up.railway.app'); // conexión WebSocket apuntando a tu dominio de Railway
+const conectar = async () => {
+    if (!nombre.trim()) return alert("Por favor, ingresa tu nombre");
+    if (!dbReady) await inicializarDB();
+    
+    // CAMBIO AQUÍ: Apuntando a tu servidor real en Railway con protocolo seguro wss
+    const ws = new WebSocket('wss://chat-servidor-production.up.railway.app');
 
     ws.onopen = () => {
-      console.log('Conectado al servidor de Railway');
-      ws.send(JSON.stringify({ type: 'join', user: nombre })); //se le dice al servidor quién soy
       setConectado(true);
+      ws.send(JSON.stringify({ mensaje: 'IDENTIFICACION', data: nombre }));
+      if (nombre === 'chatCarlosTodos') setReceptor('chatCarlosTodos');
     };
 
-    ws.onmessage = (event) => {
-      const data = JSON.parse(event.data);
-      if (data.type === 'message') { // mensajes que el servidor saca de MySQL
-        setMensajes((prev) => [...prev, data.message]);
+    ws.onmessage = async (e) => {
+      const { mensaje, data } = JSON.parse(e.data);
+      
+      if (mensaje === 'IDENTIFICATE') ws.send(JSON.stringify({ mensaje: 'IDENTIFICACION', data: nombre }));
+      if (mensaje === 'CONECTADOS') setUsuarios(data);
+
+      if (mensaje === 'GRUPO_CREAR' || mensaje === 'GRUPO_ACTUALIZAR') {
+        if (!data || !data.id || !Array.isArray(data.integrantes)) return;
+        if (!data.integrantes.includes(nombre)) return;
+
+        const grupo = { id: data.id, integrantes: data.integrantes };
+        await (mensaje === 'GRUPO_CREAR' ? crearGrupo(data.id, data.integrantes) : actualizarGrupo(data.id, data.integrantes));
+        return;
+      }
+      
+      if (mensaje === 'CHAT') {
+        // 1. Detectar si es una confirmación de lectura [VISTO]
+        if (data.mensaje.startsWith('[VISTO]')) {
+          const idMensajeVisto = data.mensaje.replace('[VISTO]', '');
+          setMensajes(prev => prev.map(m => m.id === idMensajeVisto ? { ...m, visto: true } : m));
+          return; // No mostramos este mensaje en el chat
+        }
+
+        if (data.emisor === nombre) return;
+
+        const esGrupal = !!data.grupo || data.mensaje.startsWith('[G]');
+        const grupoId = data.grupo || (data.mensaje.startsWith('[G]') ? 'chatCarlosTodos' : null);
+        const textoLimpio = esGrupal ? data.mensaje.replace('[G]', '') : data.mensaje;
+        const idEntrante = data.id || `m-${Date.now()}-${data.emisor}`;
+        const origen = grupoId || data.emisor;
+
+        if (soyCarlos && !esGrupal) return;
+
+        // Manejo de notificaciones
+        if (origen !== receptorRef.current) {
+          setNoLeidos(prev => ({ ...prev, [origen]: (prev[origen] || 0) + 1 }));
+        }
+
+        const chatId = grupoId ? grupoId : getConversationId(data.emisor)
+        const timestamp = Date.now()
+        const mensajeRegistrado = {
+          id: idEntrante,
+          emisor: data.emisor,
+          mensaje: textoLimpio,
+          esGrupal,
+          grupo: grupoId,
+          chatConOriginal: data.emisor,
+          chatId,
+          timestamp,
+          hora: new Date(timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
+          visto: false
+        }
+
+        // Agregar mensaje a la lista solo si no existe
+        setMensajes(prev => {
+          if (prev.some(m => m.id === mensajeRegistrado.id && m.chatId === mensajeRegistrado.chatId)) return prev
+          return [...prev, mensajeRegistrado]
+        })
+
+        // Guardar mensaje recibido en DB
+        if (db) {
+          db.addMensaje(chatId, mensajeRegistrado);
+        }
+
+        // Visto, solo si es chat privado y tenemos el chat abierto
+        if (!esGrupal && origen === receptorRef.current) {
+          ws.send(JSON.stringify({
+            mensaje: 'CHAT',
+            data: { 
+              receptor: [data.emisor], 
+              mensaje: `[VISTO]${idEntrante}`,
+              id: `ack-${idEntrante}` 
+            }
+          }));
+        }
       }
     };
 
-    ws.onclose = () => {
-      console.log('Conexión cerrada');
-      setConectado(false);
-    };
-
+    ws.onclose = () => setConectado(false);
     setSocket(ws);
-  }
-};
+  };
 
   const seleccionarChat = (idChat) => {
     setReceptor(idChat);
@@ -284,19 +352,64 @@ const App = () => {
     });
   };
 
-  const enviar = (e) => {
-  e.preventDefault();
-  if (inputMensaje.trim() && socket) {
+  const enviar = async (e) => {
+    e.preventDefault();
+    if (!inputMensaje.trim() || !receptor) return;
+
+    const grupoSeleccionado = grupos.find(g => g.id === receptor);
+    const esGrupal = receptor === 'chatCarlosTodos' || !!grupoSeleccionado;
+    const listaReceptores = grupoSeleccionado
+      ? grupoSeleccionado.integrantes.filter(u => u !== nombre)
+      : esGrupal
+        ? usuarios.filter(u => u !== nombre)
+        : [receptor];
+
+    if (!listaReceptores.length) return;
+
+    const mensajeAEnviar = esGrupal ? `[G]${inputMensaje}` : inputMensaje;
+    const idMiMensaje = `m-${Date.now()}-${nombre}`;
+
     const mensajeData = {
-      type: 'message',
-      text: inputMensaje,
-      sender: nombre,
-      timestamp: new Date().toISOString()
+      id: idMiMensaje,
+      receptor: listaReceptores,
+      mensaje: mensajeAEnviar
     };
-    socket.send(JSON.stringify(mensajeData)); //mensaje al servidor para que lo guarde en MySQL
+
+    if (grupoSeleccionado) mensajeData.grupo = receptor;
+    if (receptor === 'chatCarlosTodos') mensajeData.grupo = 'chatCarlosTodos';
+
+    socket.send(JSON.stringify({ 
+      mensaje: 'CHAT', 
+      data: mensajeData 
+    }));
+    
+    const timestamp = Date.now()
+    const mensajeObj = { 
+      id: idMiMensaje,
+      emisor: 'Yo', 
+      mensaje: inputMensaje, 
+      esGrupal, 
+      grupo: grupoSeleccionado ? receptor : receptor === 'chatCarlosTodos' ? 'chatCarlosTodos' : null,
+      chatConOriginal: receptor, 
+      chatId: grupoSeleccionado ? receptor : receptor === 'chatCarlosTodos' ? 'chatCarlosTodos' : getConversationId(receptor),
+      timestamp,
+      hora: new Date(timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
+      visto: false 
+    };
+    
+    const mensajeObjConId = mensajeObj
+    setMensajes(prev => {
+      if (prev.some(m => m.id === mensajeObjConId.id && m.chatId === mensajeObjConId.chatId)) return prev
+      return [...prev, mensajeObjConId]
+    })
+    
+    // CORRECCIÓN AQUÍ: Se cambió 'chatId' (que no existía declarado) por 'mensajeObjConId.chatId'
+    if (db) {
+      await db.addMensaje(mensajeObjConId.chatId, mensajeObjConId);
+    }
+    
     setInputMensaje('');
-  }
-};
+  };
 
   //Componentes de interfaz
   const NotificationBadge = ({ count }) => {
